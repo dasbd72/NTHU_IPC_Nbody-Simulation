@@ -41,8 +41,9 @@ double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
 void read_input(const char* filename, int& n, int& planet, int& asteroid,
                 std::vector<double>& qx, std::vector<double>& qy, std::vector<double>& qz,
                 std::vector<double>& vx, std::vector<double>& vy, std::vector<double>& vz,
-                std::vector<double>& m, std::vector<std::string>& type) {
+                std::vector<double>& m, std::vector<bool>& isdevice, std::vector<int>& devices) {
     std::ifstream fin(filename);
+    std::string type;
     fin >> n >> planet >> asteroid;
     qx.resize(n);
     qy.resize(n);
@@ -51,9 +52,13 @@ void read_input(const char* filename, int& n, int& planet, int& asteroid,
     vy.resize(n);
     vz.resize(n);
     m.resize(n);
-    type.resize(n);
+    isdevice.resize(n);
     for (int i = 0; i < n; i++) {
-        fin >> qx[i] >> qy[i] >> qz[i] >> vx[i] >> vy[i] >> vz[i] >> m[i] >> type[i];
+        fin >> qx[i] >> qy[i] >> qz[i] >> vx[i] >> vy[i] >> vz[i] >> m[i] >> type;
+        if (type == "device") {
+            isdevice[i] = true;
+            devices.push_back(i);
+        }
     }
 }
 
@@ -70,7 +75,7 @@ void write_output(const char* filename, double min_dist, int hit_time_step,
 void run_step(int step, int n, std::vector<double>& qx, std::vector<double>& qy,
               std::vector<double>& qz, std::vector<double>& vx, std::vector<double>& vy,
               std::vector<double>& vz, const std::vector<double>& m,
-              const std::vector<std::string>& type) {
+              const std::vector<bool>& isdevice) {
     // compute accelerations
     std::vector<double> ax(n), ay(n), az(n);
     for (int i = 0; i < n; i++) {
@@ -78,7 +83,7 @@ void run_step(int step, int n, std::vector<double>& qx, std::vector<double>& qy,
             if (j == i)
                 continue;
             double mj = m[j];
-            if (type[j] == "device") {
+            if (isdevice[j]) {
                 mj = param::gravity_device_mass(mj, step * param::dt);
             }
             double dx = qx[j] - qx[i];
@@ -112,27 +117,28 @@ int main(int argc, char** argv) {
         throw std::runtime_error("must supply 2 arguments");
     }
     int n, planet, asteroid;
+    std::vector<double> qx0, qy0, qz0, vx0, vy0, vz0, m0;
     std::vector<double> qx, qy, qz, vx, vy, vz, m;
-    std::vector<std::string> type;
+    std::vector<bool> isdevice;
+    std::vector<int> devices;
+    read_input(argv[1], n, planet, asteroid, qx0, qy0, qz0, vx0, vy0, vz0, m0, isdevice, devices);
 
-    auto distance = [&](int i, int j) -> double {
-        double dx = qx[i] - qx[j];
-        double dy = qy[i] - qy[j];
-        double dz = qz[i] - qz[j];
-        return sqrt(dx * dx + dy * dy + dz * dz);
-    };
+    double min_dist = std::numeric_limits<double>::infinity();
+    int hit_time_step = -2;
+    int gravity_device_id = -1;
+    double missile_cost = 0;
 
     // Problem 1
-    double min_dist = std::numeric_limits<double>::infinity();
-    read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
+    min_dist = std::numeric_limits<double>::infinity();
+    qx = qx0, qy = qy0, qz = qz0, vx = vx0, vy = vy0, vz = vz0, m = m0;
     for (int i = 0; i < n; i++) {
-        if (type[i] == "device") {
+        if (isdevice[i]) {
             m[i] = 0;
         }
     }
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            run_step(step, n, qx, qy, qz, vx, vy, vz, m, type);
+            run_step(step, n, qx, qy, qz, vx, vy, vz, m, isdevice);
         }
         double dx = qx[planet] - qx[asteroid];
         double dy = qy[planet] - qy[asteroid];
@@ -141,11 +147,11 @@ int main(int argc, char** argv) {
     }
 
     // Problem 2
-    int hit_time_step = -2;
-    read_input(argv[1], n, planet, asteroid, qx, qy, qz, vx, vy, vz, m, type);
+    hit_time_step = -2;
+    qx = qx0, qy = qy0, qz = qz0, vx = vx0, vy = vy0, vz = vz0, m = m0;
     for (int step = 0; step <= param::n_steps; step++) {
         if (step > 0) {
-            run_step(step, n, qx, qy, qz, vx, vy, vz, m, type);
+            run_step(step, n, qx, qy, qz, vx, vy, vz, m, isdevice);
         }
         double dx = qx[planet] - qx[asteroid];
         double dy = qy[planet] - qy[asteroid];
@@ -157,9 +163,43 @@ int main(int argc, char** argv) {
     }
 
     // Problem 3
-    // TODO
-    int gravity_device_id = -999;
-    double missile_cost = -999;
+    if (hit_time_step != -2) {
+        gravity_device_id = -1;
+        missile_cost = std::numeric_limits<double>::infinity();
+        for (int d : devices) {
+            qx = qx0, qy = qy0, qz = qz0, vx = vx0, vy = vy0, vz = vz0, m = m0;
+            bool hit = false;
+            double cost = std::numeric_limits<double>::infinity();
+            for (int step = 0; step <= param::n_steps && !hit; step++) {
+                if (step > 0) {
+                    run_step(step, n, qx, qy, qz, vx, vy, vz, m, isdevice);
+                }
+                double dx = qx[planet] - qx[asteroid];
+                double dy = qy[planet] - qy[asteroid];
+                double dz = qz[planet] - qz[asteroid];
+                if (dx * dx + dy * dy + dz * dz < param::planet_radius * param::planet_radius) {
+                    hit = true;
+                }
+                if (m[d] != 0.0) {
+                    dx = qx[planet] - qx[d];
+                    dy = qy[planet] - qy[d];
+                    dz = qz[planet] - qz[d];
+                    double missle_dist = param::missile_speed * step * param::dt;
+                    if (dx * dx + dy * dy + dz * dz < missle_dist * missle_dist) {
+                        m[d] = 0.0;
+                        cost = param::get_missile_cost((step + 1) * param::dt);
+                    }
+                }
+            }
+            if (!hit && cost < missile_cost) {
+                gravity_device_id = d;
+                missile_cost = cost;
+            }
+        }
+        if (gravity_device_id == -1) {
+            missile_cost = 0;
+        }
+    }
 
     write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
 }
