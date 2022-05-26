@@ -145,7 +145,7 @@ int main(int argc, char** argv) {
     write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
 }
 
-/* 
+/*
 make; srun -pipc22 -c2 --gres=gpu:2 ./hw5 testcases/b20.in outputs/b20.out
 make; srun -pipc22 -c2 --gres=gpu:2 ./hw5 testcases/b30.in outputs/b30.out
 make; srun -pipc22 -c2 --gres=gpu:2 ./hw5 testcases/b40.in outputs/b40.out
