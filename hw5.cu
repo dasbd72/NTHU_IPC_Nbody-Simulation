@@ -1,3 +1,8 @@
+#define DEBUG
+
+#include <omp.h>
+#include <pthread.h>
+
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -5,6 +10,20 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef DEBUG
+#include <chrono>
+#define __debug_printf(fmt, args...) printf(fmt, ##args);
+#define __START_TIME(ID) auto start_##ID = std::chrono::high_resolution_clock::now();
+#define __END_TIME(ID)                                                                                         \
+    auto stop_##ID = std::chrono::high_resolution_clock::now();                                                \
+    int duration_##ID = std::chrono::duration_cast<std::chrono::milliseconds>(stop_##ID - start_##ID).count(); \
+    __debug_printf("duration of %s: %d milliseconds\n", #ID, duration_##ID);
+#else
+#define __debug_printf(fmt, args...)
+#define __START_TIME(ID)
+#define __END_TIME(ID)
+#endif
 
 namespace param {
 const int n_steps = 200000;
