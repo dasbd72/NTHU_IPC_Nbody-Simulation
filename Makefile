@@ -1,6 +1,6 @@
 CXX := g++
-CXXFLAGS := -std=c++11 -O3 -Xcompiler -fopenmp
-NVFLAGS := $(CXXFLAGS)
+CXXFLAGS := -std=c++11 -O3
+NVFLAGS := $(CXXFLAGS) -Xptxas=-v -arch=sm_61 --use_fast_math -Xcompiler -fopenmp
 TARGET := hw5
 SEQUENTIAL := nbody
 
