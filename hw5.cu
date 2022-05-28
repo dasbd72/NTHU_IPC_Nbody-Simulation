@@ -21,10 +21,24 @@
     auto stop_##ID = std::chrono::high_resolution_clock::now();                                                \
     int duration_##ID = std::chrono::duration_cast<std::chrono::milliseconds>(stop_##ID - start_##ID).count(); \
     __debug_printf("duration of %s: %d milliseconds\n", #ID, duration_##ID);
+#define CUDA_CALL(F)                                                          \
+    if ((F != cudaSuccess)) {                                                 \
+        printf("Error %s at %s:%d\n", cudaGetErrorString(cudaGetLastError()), \
+               __FILE__, __LINE__);                                           \
+        exit(-1);                                                             \
+    }
+#define CUDA_CHECK()                                                          \
+    if ((cudaPeekAtLastError()) != cudaSuccess) {                             \
+        printf("Error %s at %s:%d\n", cudaGetErrorString(cudaGetLastError()), \
+               __FILE__, __LINE__ - 1);                                       \
+        exit(-1);                                                             \
+    }
 #else
 #define __debug_printf(fmt, args...)
 #define __START_TIME(ID)
 #define __END_TIME(ID)
+#define CUDA_CALL(F) (F)
+#define CUDA_CHECK()
 #endif
 
 namespace param {
@@ -45,16 +59,8 @@ const double missile_speed = 1e6;
 double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
 
 const int threads_per_block = 256;
+const int cuda_nstreams = 3;
 }  // namespace param
-
-void cudaErrorPrint(cudaError_t err, int line) {
-#ifdef DEBUG
-    if (err != cudaSuccess) {
-        __debug_printf("Error %s at line %d\n", cudaGetErrorString(err), line);
-        exit(1);
-    }
-#endif
-}
 
 void read_input(const char* filename, int& n, int& planet, int& asteroid, double*& qx, double*& qy, double*& qz,
                 double*& vx, double*& vy, double*& vz, double*& m, int& device_cnt, int*& devices) {
@@ -138,8 +144,21 @@ __global__ void update_velocities_gpu(int n, double* vx, double* vy, double* vz,
     // update velocities
     if (i < n) {
         vx[i] += ax[i] * param::dt;
-        vy[i] += ay[i] * param::dt;
-        vz[i] += az[i] * param::dt;
+    } else if (i < 2 * n) {
+        vy[i - n] += ay[i - n] * param::dt;
+    } else if (i < 3 * n) {
+        vz[i - 2 * n] += az[i - 2 * n] * param::dt;
+    }
+}
+
+__global__ void clear_a_gpu(int n, double* ax, double* ay, double* az) {
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < n) {
+        ax[i] = 0;
+    } else if (i < 2 * n) {
+        ay[i - n] = 0;
+    } else if (i < 3 * n) {
+        az[i - 2 * n] = 0;
     }
 }
 
@@ -148,8 +167,10 @@ __global__ void update_positions_gpu(int n, double* qx, double* qy, double* qz, 
     // update positions
     if (i < n) {
         qx[i] += vx[i] * param::dt;
-        qy[i] += vy[i] * param::dt;
-        qz[i] += vz[i] * param::dt;
+    } else if (i < 2 * n) {
+        qy[i - n] += vy[i - n] * param::dt;
+    } else if (i < 3 * n) {
+        qz[i - 2 * n] += vz[i - 2 * n] * param::dt;
     }
 }
 
@@ -178,48 +199,48 @@ int main(int argc, char** argv) {
     {
         int thread_id = omp_get_thread_num();
         cudaSetDevice(thread_id);
+        cudaStream_t streams[param::cuda_nstreams];
+        for (int i = 0; i < param::cuda_nstreams; i++) {
+            cudaStreamCreate(&streams[i]);
+        }
 
+        double *qx, *qy, *qz;
         double *g_qx, *g_qy, *g_qz, *g_vx, *g_vy, *g_vz, *g_ax, *g_ay, *g_az, *g_m;
         bool* g_isdevice;
         int* g_devices;
 
-        cudaErrorPrint(cudaMalloc(&g_qx, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_qy, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_qz, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_vx, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_vy, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_vz, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_ax, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_ay, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_az, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_m, n * sizeof(double)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_isdevice, n * sizeof(bool)), __LINE__);
-        cudaErrorPrint(cudaMalloc(&g_devices, device_cnt * sizeof(int)), __LINE__);
+        CUDA_CALL(cudaMalloc(&g_qx, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_qy, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_qz, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_vx, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_vy, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_vz, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_ax, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_ay, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_az, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_m, n * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&g_isdevice, n * sizeof(bool)));
+        CUDA_CALL(cudaMalloc(&g_devices, device_cnt * sizeof(int)));
 
-        cudaErrorPrint(cudaMemcpyAsync(g_qx, qx0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-        cudaErrorPrint(cudaMemcpyAsync(g_qy, qy0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-        cudaErrorPrint(cudaMemcpyAsync(g_qz, qz0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-        cudaErrorPrint(cudaMemcpyAsync(g_vx, vx0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-        cudaErrorPrint(cudaMemcpyAsync(g_vy, vy0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-        cudaErrorPrint(cudaMemcpyAsync(g_vz, vz0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-        cudaErrorPrint(cudaMemcpyAsync(g_m, m0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-        cudaErrorPrint(cudaMemcpyAsync(g_devices, devices, device_cnt * sizeof(int), cudaMemcpyHostToDevice), __LINE__);
-
-        clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_isdevice);
-        cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-        set_isdevice_gpu<<<GridDim(n), BlockDim>>>(device_cnt, g_devices, g_isdevice);
-
-        if (thread_id == 0) {
-            min_dist = std::numeric_limits<double>::infinity();
-        } else if (thread_id == 1) {
-            hit_time_step = -2;
-        }
+        CUDA_CALL(cudaMemcpyAsync(g_qx, qx0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+        CUDA_CALL(cudaMemcpyAsync(g_qy, qy0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+        CUDA_CALL(cudaMemcpyAsync(g_qz, qz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+        CUDA_CALL(cudaMemcpyAsync(g_vx, vx0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+        CUDA_CALL(cudaMemcpyAsync(g_vy, vy0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+        CUDA_CALL(cudaMemcpyAsync(g_vz, vz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+        CUDA_CALL(cudaMemcpyAsync(g_m, m0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+        CUDA_CALL(cudaMemcpyAsync(g_devices, devices, device_cnt * sizeof(int), cudaMemcpyHostToDevice, streams[0]));
+        clear_a_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_ax, g_ay, g_az);
+        clear_array_gpu<<<GridDim(n), BlockDim, 0, streams[0]>>>(n, g_isdevice);
+        set_isdevice_gpu<<<GridDim(n), BlockDim, 0, streams[0]>>>(device_cnt, g_devices, g_isdevice);
+        qx = (double*)malloc(n * sizeof(double));
+        qy = (double*)malloc(n * sizeof(double));
+        qz = (double*)malloc(n * sizeof(double));
 
         for (int step = 0; step <= param::n_steps; step++) {
-            double dx, dy, dz;
-            double qx_p, qx_a;
-            double qy_p, qy_a;
-            double qz_p, qz_a;
+            double dx, qx_p, qx_a;
+            double dy, qy_p, qy_a;
+            double dz, qz_p, qz_a;
             if (step == 0) {
                 qx_p = qx0[planet];
                 qy_p = qy0[planet];
@@ -228,22 +249,25 @@ int main(int argc, char** argv) {
                 qy_a = qy0[asteroid];
                 qz_a = qz0[asteroid];
             } else {
-                clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_ax);
-                clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_ay);
-                clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_az);
-                cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-                compute_accelerations_gpu<<<GridDim(n * n), BlockDim>>>(thread_id == 0, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, g_isdevice);
-                cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-                update_velocities_gpu<<<GridDim(n), BlockDim>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
-                cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-                update_positions_gpu<<<GridDim(n), BlockDim>>>(n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz);
-                cudaErrorPrint(cudaMemcpyAsync(&qx_p, g_qx + planet, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                cudaErrorPrint(cudaMemcpyAsync(&qy_p, g_qy + planet, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                cudaErrorPrint(cudaMemcpyAsync(&qz_p, g_qz + planet, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                cudaErrorPrint(cudaMemcpyAsync(&qx_a, g_qx + asteroid, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                cudaErrorPrint(cudaMemcpyAsync(&qy_a, g_qy + asteroid, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                cudaErrorPrint(cudaMemcpyAsync(&qz_a, g_qz + asteroid, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
+                cudaStreamSynchronize(streams[1]);
+                if (thread_id == 0)
+                    compute_accelerations_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(true, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, g_isdevice);
+                else
+                    compute_accelerations_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(false, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, g_isdevice);
+                update_velocities_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
+                cudaStreamSynchronize(streams[0]);
+                clear_a_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_ax, g_ay, g_az);
+                update_positions_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz);
+                CUDA_CALL(cudaMemcpyAsync(qx, g_qx, n * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
+                CUDA_CALL(cudaMemcpyAsync(qy, g_qy, n * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
+                CUDA_CALL(cudaMemcpyAsync(qz, g_qz, n * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
+                CUDA_CALL(cudaStreamSynchronize(streams[0]));
+                qx_p = qx[planet];
+                qy_p = qy[planet];
+                qz_p = qz[planet];
+                qx_a = qx[asteroid];
+                qy_a = qy[asteroid];
+                qz_a = qz[asteroid];
             }
             dx = qx_p - qx_a;
             dy = qy_p - qy_a;
@@ -257,18 +281,21 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        cudaErrorPrint(cudaFree(g_qx), __LINE__);
-        cudaErrorPrint(cudaFree(g_qy), __LINE__);
-        cudaErrorPrint(cudaFree(g_qz), __LINE__);
-        cudaErrorPrint(cudaFree(g_vx), __LINE__);
-        cudaErrorPrint(cudaFree(g_vy), __LINE__);
-        cudaErrorPrint(cudaFree(g_vz), __LINE__);
-        cudaErrorPrint(cudaFree(g_ax), __LINE__);
-        cudaErrorPrint(cudaFree(g_ay), __LINE__);
-        cudaErrorPrint(cudaFree(g_az), __LINE__);
-        cudaErrorPrint(cudaFree(g_m), __LINE__);
-        cudaErrorPrint(cudaFree(g_isdevice), __LINE__);
-        cudaErrorPrint(cudaFree(g_devices), __LINE__);
+        for (int i = 0; i < param::cuda_nstreams; i++) {
+            cudaStreamDestroy(streams[i]);
+        }
+        CUDA_CALL(cudaFree(g_qx));
+        CUDA_CALL(cudaFree(g_qy));
+        CUDA_CALL(cudaFree(g_qz));
+        CUDA_CALL(cudaFree(g_vx));
+        CUDA_CALL(cudaFree(g_vy));
+        CUDA_CALL(cudaFree(g_vz));
+        CUDA_CALL(cudaFree(g_ax));
+        CUDA_CALL(cudaFree(g_ay));
+        CUDA_CALL(cudaFree(g_az));
+        CUDA_CALL(cudaFree(g_m));
+        CUDA_CALL(cudaFree(g_isdevice));
+        CUDA_CALL(cudaFree(g_devices));
     }
 
     if (hit_time_step != -2) {
@@ -276,49 +303,56 @@ int main(int argc, char** argv) {
         gravity_device_id = -1;
         missile_cost = std::numeric_limits<double>::infinity();
 #pragma omp parallel for schedule(static) num_threads(2)
-        for (int i = 0; i < device_cnt; i++) {
+        for (int di = 0; di < device_cnt; di++) {
             int thread_id = omp_get_thread_num();
             cudaSetDevice(thread_id);
+            cudaStream_t streams[param::cuda_nstreams];
+            for (int i = 0; i < param::cuda_nstreams; i++) {
+                cudaStreamCreate(&streams[i]);
+            }
 
+            double *qx, *qy, *qz;
             double *g_qx, *g_qy, *g_qz, *g_vx, *g_vy, *g_vz, *g_ax, *g_ay, *g_az, *g_m;
             bool* g_isdevice;
             int* g_devices;
 
-            cudaErrorPrint(cudaMalloc(&g_qx, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_qy, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_qz, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_vx, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_vy, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_vz, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_ax, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_ay, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_az, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_m, n * sizeof(double)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_isdevice, n * sizeof(bool)), __LINE__);
-            cudaErrorPrint(cudaMalloc(&g_devices, device_cnt * sizeof(int)), __LINE__);
+            CUDA_CALL(cudaMalloc(&g_qx, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_qy, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_qz, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_vx, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_vy, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_vz, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_ax, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_ay, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_az, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_m, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_isdevice, n * sizeof(bool)));
+            CUDA_CALL(cudaMalloc(&g_devices, device_cnt * sizeof(int)));
 
-            cudaErrorPrint(cudaMemcpyAsync(g_qx, qx0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-            cudaErrorPrint(cudaMemcpyAsync(g_qy, qy0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-            cudaErrorPrint(cudaMemcpyAsync(g_qz, qz0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-            cudaErrorPrint(cudaMemcpyAsync(g_vx, vx0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-            cudaErrorPrint(cudaMemcpyAsync(g_vy, vy0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-            cudaErrorPrint(cudaMemcpyAsync(g_vz, vz0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-            cudaErrorPrint(cudaMemcpyAsync(g_m, m0, n * sizeof(double), cudaMemcpyHostToDevice), __LINE__);
-            cudaErrorPrint(cudaMemcpyAsync(g_devices, devices, device_cnt * sizeof(int), cudaMemcpyHostToDevice), __LINE__);
+            CUDA_CALL(cudaMemcpyAsync(g_qx, qx0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+            CUDA_CALL(cudaMemcpyAsync(g_qy, qy0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+            CUDA_CALL(cudaMemcpyAsync(g_qz, qz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+            CUDA_CALL(cudaMemcpyAsync(g_vx, vx0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+            CUDA_CALL(cudaMemcpyAsync(g_vy, vy0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+            CUDA_CALL(cudaMemcpyAsync(g_vz, vz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+            CUDA_CALL(cudaMemcpyAsync(g_m, m0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
+            CUDA_CALL(cudaMemcpyAsync(g_devices, devices, device_cnt * sizeof(int), cudaMemcpyHostToDevice, streams[0]));
+            clear_a_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_ax, g_ay, g_az);
+            clear_array_gpu<<<GridDim(n), BlockDim, 0, streams[0]>>>(n, g_isdevice);
+            set_isdevice_gpu<<<GridDim(n), BlockDim, 0, streams[0]>>>(device_cnt, g_devices, g_isdevice);
+            qx = (double*)malloc(n * sizeof(double));
+            qy = (double*)malloc(n * sizeof(double));
+            qz = (double*)malloc(n * sizeof(double));
 
-            clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_isdevice);
-            cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-            set_isdevice_gpu<<<GridDim(n), BlockDim>>>(device_cnt, g_devices, g_isdevice);
-
-            int d = devices[i];
-            bool hit = false, destroyed = (m0[d] == 0);
+            int d = devices[di];
+            bool hit = false;
+            bool destroyed = (m0[d] == 0);
             double cost = std::numeric_limits<double>::infinity();
 
             for (int step = 0; step <= param::n_steps && !hit; step++) {
-                double dx, dy, dz;
-                double qx_p, qx_a, qx_d;
-                double qy_p, qy_a, qy_d;
-                double qz_p, qz_a, qz_d;
+                double dx, qx_p, qx_a, qx_d;
+                double dy, qy_p, qy_a, qy_d;
+                double dz, qz_p, qz_a, qz_d;
                 if (step == 0) {
                     qx_p = qx0[planet];
                     qy_p = qy0[planet];
@@ -327,22 +361,22 @@ int main(int argc, char** argv) {
                     qy_a = qy0[asteroid];
                     qz_a = qz0[asteroid];
                 } else {
-                    clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_ax);
-                    clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_ay);
-                    clear_array_gpu<<<GridDim(n), BlockDim>>>(n, g_az);
-                    cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-                    compute_accelerations_gpu<<<GridDim(n * n), BlockDim>>>(false, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, g_isdevice);
-                    cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-                    update_velocities_gpu<<<GridDim(n), BlockDim>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
-                    cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
-                    update_positions_gpu<<<GridDim(n), BlockDim>>>(n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz);
-                    cudaErrorPrint(cudaMemcpyAsync(&qx_p, g_qx + planet, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                    cudaErrorPrint(cudaMemcpyAsync(&qy_p, g_qy + planet, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                    cudaErrorPrint(cudaMemcpyAsync(&qz_p, g_qz + planet, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                    cudaErrorPrint(cudaMemcpyAsync(&qx_a, g_qx + asteroid, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                    cudaErrorPrint(cudaMemcpyAsync(&qy_a, g_qy + asteroid, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                    cudaErrorPrint(cudaMemcpyAsync(&qz_a, g_qz + asteroid, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                    cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
+                    cudaStreamSynchronize(streams[1]);
+                    compute_accelerations_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(false, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, g_isdevice);
+                    update_velocities_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
+                    cudaStreamSynchronize(streams[0]);
+                    clear_a_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_ax, g_ay, g_az);
+                    update_positions_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz);
+                    CUDA_CALL(cudaMemcpyAsync(qx, g_qx, n * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
+                    CUDA_CALL(cudaMemcpyAsync(qy, g_qy, n * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
+                    CUDA_CALL(cudaMemcpyAsync(qz, g_qz, n * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
+                    CUDA_CALL(cudaStreamSynchronize(streams[0]));
+                    qx_p = qx[planet];
+                    qy_p = qy[planet];
+                    qz_p = qz[planet];
+                    qx_a = qx[asteroid];
+                    qy_a = qy[asteroid];
+                    qz_a = qz[asteroid];
                 }
                 dx = qx_p - qx_a;
                 dy = qy_p - qy_a;
@@ -357,10 +391,9 @@ int main(int argc, char** argv) {
                         qy_d = qy0[d];
                         qz_d = qz0[d];
                     } else {
-                        cudaErrorPrint(cudaMemcpyAsync(&qx_d, g_qx + d, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                        cudaErrorPrint(cudaMemcpyAsync(&qy_d, g_qy + d, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                        cudaErrorPrint(cudaMemcpyAsync(&qz_d, g_qz + d, sizeof(double), cudaMemcpyDeviceToHost), __LINE__);
-                        cudaErrorPrint(cudaDeviceSynchronize(), __LINE__);
+                        qx_d = qx[d];
+                        qy_d = qy[d];
+                        qz_d = qz[d];
                     }
                     dx = qx_p - qx_d;
                     dy = qy_p - qy_d;
@@ -369,7 +402,7 @@ int main(int argc, char** argv) {
                     if (dx * dx + dy * dy + dz * dz < missle_dist * missle_dist) {
                         destroyed = true;
                         cost = param::get_missile_cost((step + 1) * param::dt);
-                        cudaErrorPrint(cudaMemset(g_m + d, 0, sizeof(double)), __LINE__);
+                        CUDA_CALL(cudaMemsetAsync(g_m + d, 0, sizeof(double), streams[0]));
                     }
                 }
             }
@@ -378,18 +411,21 @@ int main(int argc, char** argv) {
                 gravity_device_id = d;
                 missile_cost = cost;
             }
-            cudaErrorPrint(cudaFree(g_qx), __LINE__);
-            cudaErrorPrint(cudaFree(g_qy), __LINE__);
-            cudaErrorPrint(cudaFree(g_qz), __LINE__);
-            cudaErrorPrint(cudaFree(g_vx), __LINE__);
-            cudaErrorPrint(cudaFree(g_vy), __LINE__);
-            cudaErrorPrint(cudaFree(g_vz), __LINE__);
-            cudaErrorPrint(cudaFree(g_ax), __LINE__);
-            cudaErrorPrint(cudaFree(g_ay), __LINE__);
-            cudaErrorPrint(cudaFree(g_az), __LINE__);
-            cudaErrorPrint(cudaFree(g_m), __LINE__);
-            cudaErrorPrint(cudaFree(g_isdevice), __LINE__);
-            cudaErrorPrint(cudaFree(g_devices), __LINE__);
+            for (int i = 0; i < param::cuda_nstreams; i++) {
+                cudaStreamDestroy(streams[i]);
+            }
+            CUDA_CALL(cudaFree(g_qx));
+            CUDA_CALL(cudaFree(g_qy));
+            CUDA_CALL(cudaFree(g_qz));
+            CUDA_CALL(cudaFree(g_vx));
+            CUDA_CALL(cudaFree(g_vy));
+            CUDA_CALL(cudaFree(g_vz));
+            CUDA_CALL(cudaFree(g_ax));
+            CUDA_CALL(cudaFree(g_ay));
+            CUDA_CALL(cudaFree(g_az));
+            CUDA_CALL(cudaFree(g_m));
+            CUDA_CALL(cudaFree(g_isdevice));
+            CUDA_CALL(cudaFree(g_devices));
         }
         if (gravity_device_id == -1) {
             missile_cost = 0;
@@ -398,7 +434,7 @@ int main(int argc, char** argv) {
 
     write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
 
-    cudaErrorPrint(cudaGetLastError(), __LINE__);
+    CUDA_CHECK();
 
     free(qx0);
     free(qy0);
