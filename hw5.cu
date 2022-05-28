@@ -44,6 +44,7 @@
 
 namespace param {
 const int n_steps = 200000;
+const int n_sync_steps = 4000;
 const double dt = 60;
 const double eps = 1e-3;
 const double sq_eps = eps * eps;
@@ -59,14 +60,16 @@ const double sq_planet_radius = planet_radius * planet_radius;
 const double missile_speed = 1e6;
 double get_missile_dist(int step) { return (missile_speed * missile_speed * dt * dt) * (step * step); }
 double get_missile_cost(double t) { return 1e5 + 1e3 * t; }
+__device__ double get_missile_cost_gpu(double t) { return 1e5 + 1e3 * t; }
 
-const int threads_per_block = 256;
+const int threads_per_block = 512;
 const int cuda_nstreams = 3;
 }  // namespace param
 
-void read_input(const char* filename, int& n, int& planet, int& asteroid, double*& qx, double*& qy, double*& qz,
+void read_input(const char* filename, int& n, double*& qx, double*& qy, double*& qz,
                 double*& vx, double*& vy, double*& vz, double*& m, int& device_cnt, int*& device_id) {
     std::ifstream fin(filename);
+    int planet, asteroid;
     fin >> n >> planet >> asteroid;
 
     std::string type;
@@ -85,7 +88,6 @@ void read_input(const char* filename, int& n, int& planet, int& asteroid, double
         if (type == "device") {
             tmp_devices.push_back(i);
         }
-        printf("%e %e %e %e %e %e %e\n", tmp_qx[i], tmp_qy[i], tmp_qz[i], tmp_vx[i], tmp_vy[i], tmp_vz[i], tmp_m[i]);
     }
 
     qx = (double*)malloc(n * sizeof(double));
@@ -101,57 +103,14 @@ void read_input(const char* filename, int& n, int& planet, int& asteroid, double
         int tmp_i;
         if (i == 0) {
             tmp_i = planet;
-            planet = i;
         } else if (i == 1) {
             tmp_i = asteroid;
-            asteroid = i;
         } else if (i < device_cnt + 2) {
             tmp_i = tmp_devices[i - 2];
             device_id[i] = tmp_devices[i - 2];
         } else {
             tmp_i = *indices.begin();
         }
-        /* if (i == 0) {
-            qx[i] = tmp_qx[planet];
-            qy[i] = tmp_qy[planet];
-            qz[i] = tmp_qz[planet];
-            vx[i] = tmp_vx[planet];
-            vy[i] = tmp_vy[planet];
-            vz[i] = tmp_vz[planet];
-            m[i] = tmp_m[planet];
-            indices.erase(planet);
-            planet = i;
-        } else if (i == 1) {
-            qx[i] = tmp_qx[asteroid];
-            qy[i] = tmp_qy[asteroid];
-            qz[i] = tmp_qz[asteroid];
-            vx[i] = tmp_vx[asteroid];
-            vy[i] = tmp_vy[asteroid];
-            vz[i] = tmp_vz[asteroid];
-            m[i] = tmp_m[asteroid];
-            indices.erase(asteroid);
-            asteroid = i;
-        } else if (i < device_cnt + 2) {
-            qx[i] = tmp_qx[tmp_devices[i - 2]];
-            qy[i] = tmp_qy[tmp_devices[i - 2]];
-            qz[i] = tmp_qz[tmp_devices[i - 2]];
-            vx[i] = tmp_vx[tmp_devices[i - 2]];
-            vy[i] = tmp_vy[tmp_devices[i - 2]];
-            vz[i] = tmp_vz[tmp_devices[i - 2]];
-            m[i] = tmp_m[tmp_devices[i - 2]];
-            device_id[i] = tmp_devices[i - 2];
-            indices.erase(tmp_devices[i - 2]);
-        } else {
-            int tmp = *indices.begin();
-            qx[i] = tmp_qx[tmp];
-            qy[i] = tmp_qy[tmp];
-            qz[i] = tmp_qz[tmp];
-            vx[i] = tmp_vx[tmp];
-            vy[i] = tmp_vy[tmp];
-            vz[i] = tmp_vz[tmp];
-            m[i] = tmp_m[tmp];
-            indices.erase(tmp);
-        } */
         qx[i] = tmp_qx[tmp_i];
         qy[i] = tmp_qy[tmp_i];
         qz[i] = tmp_qz[tmp_i];
@@ -188,7 +147,7 @@ __global__ void set_isdevice_gpu(int device_cnt, int* devices, bool* isdevice) {
     }
 }
 
-__global__ void compute_accelerations_gpu(const bool isProblem1, const int step, const int n, const double* qx, const double* qy, const double* qz, double* vx, double* vy, double* vz, double* ax, double* ay, double* az, const double* m, const int device_cnt) {
+__global__ void compute_accelerations_1_gpu(const int step, const int n, const double* qx, const double* qy, const double* qz, double* vx, double* vy, double* vz, double* ax, double* ay, double* az, const double* m, const int device_cnt) {
     int index = blockDim.x * blockIdx.x + threadIdx.x;
     int i = index / n;
     int j = index % n;
@@ -197,11 +156,56 @@ __global__ void compute_accelerations_gpu(const bool isProblem1, const int step,
     if (i < n && j < n && i != j) {
         double mj = m[j];
         if (j > 1 && j < device_cnt + 2) {
-            if (isProblem1)
-                mj = 0;
-            else
-                mj = param::gravity_device_mass_gpu(mj, step * param::dt);
+            mj = 0;
         }
+        double dx = qx[j] - qx[i];
+        double dy = qy[j] - qy[i];
+        double dz = qz[j] - qz[i];
+        double dist3 =
+            pow(dx * dx + dy * dy + dz * dz + param::eps * param::eps, 1.5);
+
+        atomicAdd(&ax[i], param::G * mj * dx / dist3);
+        atomicAdd(&ay[i], param::G * mj * dy / dist3);
+        atomicAdd(&az[i], param::G * mj * dz / dist3);
+    }
+}
+
+__global__ void compute_accelerations_2_gpu(const int step, const int n, const double* qx, const double* qy, const double* qz, double* vx, double* vy, double* vz, double* ax, double* ay, double* az, const double* m, const int device_cnt) {
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    int i = index / n;
+    int j = index % n;
+
+    // compute accelerations
+    if (i < n && j < n && i != j) {
+        double mj = m[j];
+        if (j > 1 && j < device_cnt + 2) {
+            mj = param::gravity_device_mass_gpu(mj, step * param::dt);
+        }
+        double dx = qx[j] - qx[i];
+        double dy = qy[j] - qy[i];
+        double dz = qz[j] - qz[i];
+        double dist3 =
+            pow(dx * dx + dy * dy + dz * dz + param::eps * param::eps, 1.5);
+
+        atomicAdd(&ax[i], param::G * mj * dx / dist3);
+        atomicAdd(&ay[i], param::G * mj * dy / dist3);
+        atomicAdd(&az[i], param::G * mj * dz / dist3);
+    }
+}
+
+__global__ void compute_accelerations_3_gpu(const bool* hit, const bool* destroyed, const int step, const int n, const int d, const double* qx, const double* qy, const double* qz, double* vx, double* vy, double* vz, double* ax, double* ay, double* az, const double* m, const int device_cnt) {
+    if (*hit)
+        return;
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    int i = index / n;
+    int j = index % n;
+
+    // compute accelerations
+    if (i < n && j < n && i != j) {
+        double mj = m[j];
+        if (j > 1 && j < device_cnt + 2)
+            mj = param::gravity_device_mass_gpu(mj, step * param::dt);
+
         double dx = qx[j] - qx[i];
         double dy = qy[j] - qy[i];
         double dz = qz[j] - qz[i];
@@ -252,17 +256,60 @@ __global__ void update_positions_gpu(const int n, double* qx, double* qy, double
     }
 }
 
+__global__ void problem1(double* min_dist, const int n, const double* qx, const double* qy, const double* qz) {
+    double dx = qx[0] - qx[1];
+    double dy = qy[0] - qy[1];
+    double dz = qz[0] - qz[1];
+    double tmp_dst = sqrt(dx * dx + dy * dy + dz * dz);
+    if (tmp_dst < *min_dist)
+        *min_dist = tmp_dst;
+}
+
+__global__ void problem2(int* hit_time_step, const int step, const int n, const double* qx, const double* qy, const double* qz) {
+    if (*hit_time_step != -2)
+        return;
+    double dx = qx[0] - qx[1];
+    double dy = qy[0] - qy[1];
+    double dz = qz[0] - qz[1];
+    if (dx * dx + dy * dy + dz * dz < param::planet_radius * param::planet_radius) {
+        *hit_time_step = step;
+    }
+}
+
+__global__ void problem3(bool* hit, bool* destroyed, double* cost, const int step, const int n, const int d, const double* qx, const double* qy, const double* qz, double* m) {
+    if (*hit)
+        return;
+    double dx = qx[0] - qx[1];
+    double dy = qy[0] - qy[1];
+    double dz = qz[0] - qz[1];
+    if (dx * dx + dy * dy + dz * dz < param::planet_radius * param::planet_radius) {
+        *hit = true;
+        return;
+    }
+    if (!*destroyed) {
+        dx = qx[0] - qx[d];
+        dy = qy[0] - qy[d];
+        dz = qz[0] - qz[d];
+        double missle_dist = (param::missile_speed * param::dt) * step;
+        if (dx * dx + dy * dy + dz * dz < missle_dist * missle_dist) {
+            *destroyed = true;
+            *cost = param::get_missile_cost_gpu((step + 1) * param::dt);
+            m[d] = 0;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         throw std::runtime_error("must supply 2 arguments");
     }
-    int n, planet, asteroid;
+    int n;
     double *qx0, *qy0, *qz0;
     double *vx0, *vy0, *vz0;
     double* m0;
     int device_cnt;
     int* device_id;
-    read_input(argv[1], n, planet, asteroid, qx0, qy0, qz0, vx0, vy0, vz0, m0, device_cnt, device_id);
+    read_input(argv[1], n, qx0, qy0, qz0, vx0, vy0, vz0, m0, device_cnt, device_id);
 
     double min_dist = std::numeric_limits<double>::infinity();
     int hit_time_step = -2;
@@ -277,18 +324,23 @@ int main(int argc, char** argv) {
 
 #pragma omp parallel for num_threads(2)
     for (int task = 0; task < 2; task++) {
-        cudaSetDevice(omp_get_thread_num());
+        CUDA_CALL(cudaSetDevice(omp_get_thread_num()));
         cudaStream_t streams[param::cuda_nstreams];
         for (int i = 0; i < param::cuda_nstreams; i++) {
-            cudaStreamCreate(&streams[i]);
+            CUDA_CALL(cudaStreamCreate(&streams[i]));
         }
 
-        double *qx, *qy, *qz;
+        double *p_qx, *p_qy, *p_qz;
         double *g_qx, *g_qy, *g_qz;
         double *g_vx, *g_vy, *g_vz;
         double *g_ax, *g_ay, *g_az;
         double* g_m;
+        double* g_min_dist;
+        int* g_hit_time_step;
 
+        CUDA_CALL(cudaMalloc(&p_qx, 2 * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&p_qy, 2 * sizeof(double)));
+        CUDA_CALL(cudaMalloc(&p_qz, 2 * sizeof(double)));
         CUDA_CALL(cudaMalloc(&g_qx, n * sizeof(double)));
         CUDA_CALL(cudaMalloc(&g_qy, n * sizeof(double)));
         CUDA_CALL(cudaMalloc(&g_qz, n * sizeof(double)));
@@ -299,7 +351,21 @@ int main(int argc, char** argv) {
         CUDA_CALL(cudaMalloc(&g_ay, n * sizeof(double)));
         CUDA_CALL(cudaMalloc(&g_az, n * sizeof(double)));
         CUDA_CALL(cudaMalloc(&g_m, n * sizeof(double)));
+        if (task == 0) {
+            CUDA_CALL(cudaMallocManaged(&g_min_dist, sizeof(double)));
+            CUDA_CALL(cudaMemPrefetchAsync(g_min_dist, sizeof(double), cudaCpuDeviceId, streams[1]));
+            *g_min_dist = std::numeric_limits<double>::infinity();
+            CUDA_CALL(cudaMemPrefetchAsync(g_min_dist, sizeof(double), omp_get_thread_num(), streams[1]));
+        } else if (task == 1) {
+            CUDA_CALL(cudaMallocManaged(&g_hit_time_step, sizeof(int)));
+            CUDA_CALL(cudaMemPrefetchAsync(g_hit_time_step, sizeof(int), cudaCpuDeviceId, streams[1]));
+            *g_hit_time_step = -2;
+            CUDA_CALL(cudaMemPrefetchAsync(g_hit_time_step, sizeof(int), omp_get_thread_num(), streams[1]));
+        }
 
+        CUDA_CALL(cudaMemcpyAsync(p_qx, qx0, 2 * sizeof(double), cudaMemcpyHostToDevice, streams[1]));
+        CUDA_CALL(cudaMemcpyAsync(p_qy, qy0, 2 * sizeof(double), cudaMemcpyHostToDevice, streams[1]));
+        CUDA_CALL(cudaMemcpyAsync(p_qz, qz0, 2 * sizeof(double), cudaMemcpyHostToDevice, streams[1]));
         CUDA_CALL(cudaMemcpyAsync(g_qx, qx0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
         CUDA_CALL(cudaMemcpyAsync(g_qy, qy0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
         CUDA_CALL(cudaMemcpyAsync(g_qz, qz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
@@ -308,47 +374,50 @@ int main(int argc, char** argv) {
         CUDA_CALL(cudaMemcpyAsync(g_vz, vz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
         CUDA_CALL(cudaMemcpyAsync(g_m, m0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
         clear_a_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_ax, g_ay, g_az);
-        qx = (double*)malloc(2 * sizeof(double));
-        qy = (double*)malloc(2 * sizeof(double));
-        qz = (double*)malloc(2 * sizeof(double));
-        memcpy(qx, qx0, 2 * sizeof(double));
-        memcpy(qy, qy0, 2 * sizeof(double));
-        memcpy(qz, qz0, 2 * sizeof(double));
 
-        double dx, dy, dz;
         for (int step = 0; step <= param::n_steps; step++) {
             if (step > 0) {
-                cudaStreamSynchronize(streams[1]);
                 if (task == 0)
-                    compute_accelerations_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(true, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, device_cnt);
+                    compute_accelerations_1_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, device_cnt);
                 else
-                    compute_accelerations_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(false, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, device_cnt);
+                    compute_accelerations_2_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, device_cnt);
                 update_positions_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
-                CUDA_CALL(cudaMemcpyAsync(qx, g_qx, 2 * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                CUDA_CALL(cudaMemcpyAsync(qy, g_qy, 2 * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                CUDA_CALL(cudaMemcpyAsync(qz, g_qz, 2 * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                CUDA_CALL(cudaStreamSynchronize(streams[0]));
-                update_velocities_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
+                CUDA_CALL(cudaStreamSynchronize(streams[1]));
+                CUDA_CALL(cudaMemcpy(p_qx, g_qx, 2 * sizeof(double), cudaMemcpyDeviceToDevice));
+                CUDA_CALL(cudaMemcpy(p_qy, g_qy, 2 * sizeof(double), cudaMemcpyDeviceToDevice));
+                CUDA_CALL(cudaMemcpy(p_qz, g_qz, 2 * sizeof(double), cudaMemcpyDeviceToDevice));
+                update_velocities_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
             }
-            dx = qx[planet] - qx[asteroid];
-            dy = qy[planet] - qy[asteroid];
-            dz = qz[planet] - qz[asteroid];
-
             if (task == 0) {
-                min_dist = std::min(min_dist, sqrt(dx * dx + dy * dy + dz * dz));
+                problem1<<<1, 1, 0, streams[1]>>>(g_min_dist, n, p_qx, p_qy, p_qz);
             } else if (task == 1) {
-                if (dx * dx + dy * dy + dz * dz < param::planet_radius * param::planet_radius) {
-                    hit_time_step = step;
-                    break;
+                problem2<<<1, 1, 0, streams[1]>>>(g_hit_time_step, step, n, p_qx, p_qy, p_qz);
+                if (step % param::n_sync_steps == param::n_sync_steps - 1) {
+                    CUDA_CALL(cudaMemPrefetchAsync(g_hit_time_step, sizeof(int), cudaCpuDeviceId, streams[1]));
+                    CUDA_CALL(cudaStreamSynchronize(streams[1]));
+                    hit_time_step = *g_hit_time_step;
+                    if (hit_time_step != -2)
+                        break;
                 }
             }
         }
-        for (int i = 0; i < param::cuda_nstreams; i++) {
-            cudaStreamDestroy(streams[i]);
+        if (task == 0) {
+            CUDA_CALL(cudaMemPrefetchAsync(g_min_dist, sizeof(double), cudaCpuDeviceId, streams[1]));
+            CUDA_CALL(cudaStreamSynchronize(streams[1]));
+            min_dist = *g_min_dist;
+        } else if (task == 1) {
+            if (hit_time_step == -2) {
+                CUDA_CALL(cudaMemPrefetchAsync(g_hit_time_step, sizeof(int), cudaCpuDeviceId, streams[1]));
+                CUDA_CALL(cudaStreamSynchronize(streams[1]));
+                hit_time_step = *g_hit_time_step;
+            }
         }
-        free(qx);
-        free(qy);
-        free(qz);
+        for (int i = 0; i < param::cuda_nstreams; i++) {
+            CUDA_CALL(cudaStreamDestroy(streams[i]));
+        }
+        CUDA_CALL(cudaFree(p_qx));
+        CUDA_CALL(cudaFree(p_qy));
+        CUDA_CALL(cudaFree(p_qz));
         CUDA_CALL(cudaFree(g_qx));
         CUDA_CALL(cudaFree(g_qy));
         CUDA_CALL(cudaFree(g_qz));
@@ -359,6 +428,10 @@ int main(int argc, char** argv) {
         CUDA_CALL(cudaFree(g_ay));
         CUDA_CALL(cudaFree(g_az));
         CUDA_CALL(cudaFree(g_m));
+        if (task == 0)
+            CUDA_CALL(cudaFree(g_min_dist));
+        else if (task == 1)
+            CUDA_CALL(cudaFree(g_hit_time_step));
     }  // omp end
 
     if (hit_time_step != -2) {
@@ -374,9 +447,20 @@ int main(int argc, char** argv) {
                 cudaStreamCreate(&streams[i]);
             }
 
-            double *qx, *qy, *qz;
-            double *g_qx, *g_qy, *g_qz, *g_vx, *g_vy, *g_vz, *g_ax, *g_ay, *g_az, *g_m;
+            int d = di + 2;
+            double *p_qx, *p_qy, *p_qz;
+            double *g_qx, *g_qy, *g_qz;
+            double *g_vx, *g_vy, *g_vz;
+            double *g_ax, *g_ay, *g_az;
+            double* g_m;
+            bool hit = false;
+            bool* g_hit;
+            bool* g_destroyed;
+            double* g_cost;
 
+            CUDA_CALL(cudaMalloc(&p_qx, (2 + device_cnt) * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&p_qy, (2 + device_cnt) * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&p_qz, (2 + device_cnt) * sizeof(double)));
             CUDA_CALL(cudaMalloc(&g_qx, n * sizeof(double)));
             CUDA_CALL(cudaMalloc(&g_qy, n * sizeof(double)));
             CUDA_CALL(cudaMalloc(&g_qz, n * sizeof(double)));
@@ -387,7 +471,20 @@ int main(int argc, char** argv) {
             CUDA_CALL(cudaMalloc(&g_ay, n * sizeof(double)));
             CUDA_CALL(cudaMalloc(&g_az, n * sizeof(double)));
             CUDA_CALL(cudaMalloc(&g_m, n * sizeof(double)));
+            CUDA_CALL(cudaMalloc(&g_destroyed, sizeof(bool)));
 
+            CUDA_CALL(cudaMallocManaged(&g_hit, sizeof(bool)));
+            CUDA_CALL(cudaMemPrefetchAsync(g_hit, sizeof(bool), cudaCpuDeviceId, streams[1]));
+            *g_hit = false;
+            CUDA_CALL(cudaMemPrefetchAsync(g_hit, sizeof(bool), thread_id, streams[1]));
+            CUDA_CALL(cudaMallocManaged(&g_cost, sizeof(double)));
+            CUDA_CALL(cudaMemPrefetchAsync(g_cost, sizeof(bool), cudaCpuDeviceId, streams[1]));
+            *g_cost = std::numeric_limits<double>::infinity();
+            CUDA_CALL(cudaMemPrefetchAsync(g_cost, sizeof(bool), thread_id, streams[1]));
+
+            CUDA_CALL(cudaMemcpyAsync(p_qx, qx0, (2 + device_cnt) * sizeof(double), cudaMemcpyHostToDevice, streams[1]));
+            CUDA_CALL(cudaMemcpyAsync(p_qy, qy0, (2 + device_cnt) * sizeof(double), cudaMemcpyHostToDevice, streams[1]));
+            CUDA_CALL(cudaMemcpyAsync(p_qz, qz0, (2 + device_cnt) * sizeof(double), cudaMemcpyHostToDevice, streams[1]));
             CUDA_CALL(cudaMemcpyAsync(g_qx, qx0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
             CUDA_CALL(cudaMemcpyAsync(g_qy, qy0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
             CUDA_CALL(cudaMemcpyAsync(g_qz, qz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
@@ -395,67 +492,45 @@ int main(int argc, char** argv) {
             CUDA_CALL(cudaMemcpyAsync(g_vy, vy0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
             CUDA_CALL(cudaMemcpyAsync(g_vz, vz0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
             CUDA_CALL(cudaMemcpyAsync(g_m, m0, n * sizeof(double), cudaMemcpyHostToDevice, streams[0]));
-            clear_a_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_ax, g_ay, g_az);
-            qx = (double*)malloc((2 + device_cnt) * sizeof(double));
-            qy = (double*)malloc((2 + device_cnt) * sizeof(double));
-            qz = (double*)malloc((2 + device_cnt) * sizeof(double));
-            memcpy(qx, qx0, (2 + device_cnt) * sizeof(double));
-            memcpy(qy, qy0, (2 + device_cnt) * sizeof(double));
-            memcpy(qz, qz0, (2 + device_cnt) * sizeof(double));
+            clear_a_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_ax, g_ay, g_az);
+            CUDA_CALL(cudaMemsetAsync(g_destroyed, m0[d] == 0, sizeof(bool), streams[1]));
 
-            int d = di + 2;
-            bool hit = false;
-            bool destroyed = (m0[d] == 0);
-            double cost = std::numeric_limits<double>::infinity();
-
-            double dx, dy, dz;
+            // hit break
             for (int step = 0; step <= param::n_steps && !hit; step++) {
                 if (step > 0) {
                     cudaStreamSynchronize(streams[1]);
-                    compute_accelerations_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(false, step, n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, device_cnt);
+                    compute_accelerations_3_gpu<<<GridDim(n * n), BlockDim, 0, streams[0]>>>(g_hit, g_destroyed, step, n, d, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az, g_m, device_cnt);
                     update_positions_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_qx, g_qy, g_qz, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
-                    if (!destroyed) {
-                        CUDA_CALL(cudaMemcpyAsync(qx, g_qx, (2 + device_cnt) * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                        CUDA_CALL(cudaMemcpyAsync(qy, g_qy, (2 + device_cnt) * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                        CUDA_CALL(cudaMemcpyAsync(qz, g_qz, (2 + device_cnt) * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                    } else {
-                        CUDA_CALL(cudaMemcpyAsync(qx, g_qx, 2 * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                        CUDA_CALL(cudaMemcpyAsync(qy, g_qy, 2 * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                        CUDA_CALL(cudaMemcpyAsync(qz, g_qz, 2 * sizeof(double), cudaMemcpyDeviceToHost, streams[0]));
-                    }
-                    CUDA_CALL(cudaStreamSynchronize(streams[0]));
-                    update_velocities_gpu<<<GridDim(3 * n), BlockDim, 0, streams[1]>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
+                    CUDA_CALL(cudaMemcpy(p_qx, g_qx, (2 + device_cnt) * sizeof(double), cudaMemcpyDeviceToDevice));
+                    CUDA_CALL(cudaMemcpy(p_qy, g_qy, (2 + device_cnt) * sizeof(double), cudaMemcpyDeviceToDevice));
+                    CUDA_CALL(cudaMemcpy(p_qz, g_qz, (2 + device_cnt) * sizeof(double), cudaMemcpyDeviceToDevice));
+                    update_velocities_gpu<<<GridDim(3 * n), BlockDim, 0, streams[0]>>>(n, g_vx, g_vy, g_vz, g_ax, g_ay, g_az);
                 }
-                dx = qx[planet] - qx[asteroid];
-                dy = qy[planet] - qy[asteroid];
-                dz = qz[planet] - qz[asteroid];
-                if (dx * dx + dy * dy + dz * dz < param::planet_radius * param::planet_radius) {
-                    hit = true;
-                    break;
-                }
-                if (!destroyed) {
-                    dx = qx[planet] - qx[d];
-                    dy = qy[planet] - qy[d];
-                    dz = qz[planet] - qz[d];
-                    double missle_dist = (param::missile_speed * param::dt) * step;
-                    if (dx * dx + dy * dy + dz * dz < missle_dist * missle_dist) {
-                        destroyed = true;
-                        cost = param::get_missile_cost((step + 1) * param::dt);
-                        CUDA_CALL(cudaMemsetAsync(g_m + d, 0, sizeof(double), streams[0]));
-                    }
+                problem3<<<1, 1, 0, streams[1]>>>(g_hit, g_destroyed, g_cost, step, n, d, p_qx, p_qy, p_qz, g_m);
+                if (step % param::n_sync_steps == param::n_sync_steps - 1) {
+                    CUDA_CALL(cudaMemPrefetchAsync(g_hit, sizeof(bool), cudaCpuDeviceId, streams[1]));
+                    cudaStreamSynchronize(streams[1]);
+                    hit = *g_hit;
+                    if (hit)
+                        break;
                 }
             }
+            if (!hit) {
+                CUDA_CALL(cudaMemPrefetchAsync(g_hit, sizeof(bool), cudaCpuDeviceId, streams[1]));
+                CUDA_CALL(cudaMemPrefetchAsync(g_cost, sizeof(double), cudaCpuDeviceId, streams[1]));
+                cudaStreamSynchronize(streams[1]);
 #pragma omp critical
-            if (!hit && cost < missile_cost) {
-                gravity_device_id = d;
-                missile_cost = cost;
+                if (!*g_hit && *g_cost < missile_cost) {
+                    gravity_device_id = d;
+                    missile_cost = *g_cost;
+                }
             }
             for (int i = 0; i < param::cuda_nstreams; i++) {
                 cudaStreamDestroy(streams[i]);
             }
-            free(qx);
-            free(qy);
-            free(qz);
+            CUDA_CALL(cudaFree(p_qx));
+            CUDA_CALL(cudaFree(p_qy));
+            CUDA_CALL(cudaFree(p_qz));
             CUDA_CALL(cudaFree(g_qx));
             CUDA_CALL(cudaFree(g_qy));
             CUDA_CALL(cudaFree(g_qz));
@@ -466,6 +541,9 @@ int main(int argc, char** argv) {
             CUDA_CALL(cudaFree(g_ay));
             CUDA_CALL(cudaFree(g_az));
             CUDA_CALL(cudaFree(g_m));
+            CUDA_CALL(cudaFree(g_hit));
+            CUDA_CALL(cudaFree(g_destroyed));
+            CUDA_CALL(cudaFree(g_cost));
         }  // omp end
         if (gravity_device_id == -1) {
             missile_cost = 0;
