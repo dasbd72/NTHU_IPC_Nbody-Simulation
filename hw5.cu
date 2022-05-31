@@ -1,11 +1,13 @@
 // #define DEBUG
 // #define USE_SHARED_MEMORY // slow down
-#define PROBLEM1_BREAK  // may make mistake
+// #define PROBLEM1_BREAK  // may make mistakes
+#define PROBLEM3_BREAK  // breaks when found already
 #define MATH_OPTIMIZE   // huge optomize
 #define PREPROCESS_FST  // small optimize
 
 #include <nppdefs.h>
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -433,7 +435,11 @@ void t_problem_12(int tid, int n, int device_cnt, double* qxyz, double* vxyz, do
 #endif
 }
 
+#ifdef PROBLEM3_BREAK
+void t_problem_3(int tid, int n, int& global_di, std::vector<int> sorted_di, std::vector<int> re_sorted_di, int device_cnt, int* p3_step, double* p3_qxyz, double* p3_vxyz, double* m, int& gravity_device_id, double& missile_cost, double* step2fst) {
+#else
 void t_problem_3(int tid, int n, int& global_di, int device_cnt, int* p3_step, double* p3_qxyz, double* p3_vxyz, double* m, int& gravity_device_id, double& missile_cost, double* step2fst) {
+#endif
     cudaSetDevice(tid);
     // Problem 3
     int di;
@@ -441,7 +447,11 @@ void t_problem_3(int tid, int n, int& global_di, int device_cnt, int* p3_step, d
     while (!thread_done) {
         g_mutex.lock();
         if (global_di < device_cnt)
+#ifdef PROBLEM3_BREAK
+            di = sorted_di[global_di++];
+#else
             di = global_di++;
+#endif
         else
             thread_done = true;
         g_mutex.unlock();
@@ -477,6 +487,10 @@ void t_problem_3(int tid, int n, int& global_di, int device_cnt, int* p3_step, d
 
         clear_a_gpu<<<param::GridDim(3 * n), param::BlockDim, 0, streams[0]>>>(n, g_axyz);
         for (int step = p3_step[di]; step <= param::n_steps; step++) {
+#ifdef PROBLEM3_BREAK
+            if (gravity_device_id != -1 && re_sorted_di[gravity_device_id - 2] < re_sorted_di[d - 2])
+                break;
+#endif
             if (step > p3_step[di]) {
 #ifdef PREPROCESS_FST
                 compute_accelerations_gpu<<<param::GridDim2D(n), param::BlockDim2D, 0, streams[0]>>>(step2fst[step], n, g_qxyz, g_vxyz, g_axyz, g_m, device_cnt);
@@ -543,6 +557,7 @@ int main(int argc, char** argv) {
     std::thread t0;
     t0 = std::thread(t_calc_step2fst, 1, step2fst);
     t_calc_step2fst(0, step2fst);
+    t0.join();
 #endif
 
     // part 1
@@ -556,8 +571,25 @@ int main(int argc, char** argv) {
         missile_cost = std::numeric_limits<double>::infinity();
         int global_di = 0;
 
+#ifdef PROBLEM3_BREAK
+        std::vector<std::pair<int, int>> stepxdi;
+        for (int di = 0; di < device_cnt; di++)
+            stepxdi.emplace_back(p3_step[di], di);
+        std::sort(stepxdi.begin(), stepxdi.end());
+        std::vector<int> sorted_di(device_cnt);
+        std::vector<int> re_sorted_di(device_cnt);
+        for (int i = 0; i < device_cnt; i++) {
+            int di = stepxdi[i].second;
+            sorted_di[i] = di;
+            re_sorted_di[di] = i;
+        }
+
+        t3s.push_back(std::thread(t_problem_3, 1, n, std::ref(global_di), sorted_di, re_sorted_di, device_cnt, p3_step, p3_qxyz, p3_vxyz, m, std::ref(gravity_device_id), std::ref(missile_cost), step2fst));
+        t3s.push_back(std::thread(t_problem_3, 0, n, std::ref(global_di), sorted_di, re_sorted_di, device_cnt, p3_step, p3_qxyz, p3_vxyz, m, std::ref(gravity_device_id), std::ref(missile_cost), step2fst));
+#else
         t3s.push_back(std::thread(t_problem_3, 1, n, std::ref(global_di), device_cnt, p3_step, p3_qxyz, p3_vxyz, m, std::ref(gravity_device_id), std::ref(missile_cost), step2fst));
         t3s.push_back(std::thread(t_problem_3, 0, n, std::ref(global_di), device_cnt, p3_step, p3_qxyz, p3_vxyz, m, std::ref(gravity_device_id), std::ref(missile_cost), step2fst));
+#endif
 
         for (int tid = 0; tid < 2; tid++)
             t3s[tid].join();
@@ -568,9 +600,7 @@ int main(int argc, char** argv) {
         else
             gravity_device_id = device_id[gravity_device_id];
     }
-#ifdef PREPROCESS_FST
-    t0.join();
-#endif
+
     t1.join();
 
     write_output(argv[2], min_dist, hit_time_step, gravity_device_id, missile_cost);
